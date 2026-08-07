@@ -1534,7 +1534,7 @@ public class MediaCodecVideoRenderer extends MediaCodecRenderer
         // the minimum size.
         return max(
             HEVC_MAX_INPUT_SIZE_THRESHOLD,
-            getMaxSampleSize(/* pixelCount= */ width * height, /* minCompressionRatio= */ 2));
+            getMaxSampleSize(/* pixelCount= */ width * height, /* minCompressionRatio= */ 4));
       case MimeTypes.VIDEO_H264:
         if (MediaLibraryInfo.enableWorkarounds()
             && ("BRAVIA 4K 2015".equals(Build.MODEL) // Sony Bravia 4K
