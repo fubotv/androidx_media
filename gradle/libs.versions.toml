@@ -1,5 +1,5 @@
 [versions]
-releaseVersion = "1.11.0"
+releaseVersion = "1.11.0-epl1"
 releaseVersionCode = "1011000300"
 # SDK
 compileSdkVersion = "36"
