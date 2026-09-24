@@ -30,6 +30,7 @@ import androidx.media3.common.util.Clock;
 import androidx.media3.common.util.HandlerWrapper;
 import androidx.media3.common.util.Log;
 import androidx.media3.common.util.UnstableApi;
+import androidx.media3.common.util.Util;
 import androidx.media3.exoplayer.ExoPlaybackException;
 import androidx.media3.exoplayer.ExoPlayer;
 import androidx.media3.exoplayer.LoadControl;
@@ -42,6 +43,7 @@ import androidx.media3.exoplayer.source.MediaPeriod;
 import androidx.media3.exoplayer.source.MediaSource;
 import androidx.media3.exoplayer.source.TrackGroupArray;
 import androidx.media3.exoplayer.source.WrappingMediaSource;
+import androidx.media3.exoplayer.trackselection.ExoTrackSelection;
 import androidx.media3.exoplayer.trackselection.TrackSelector;
 import androidx.media3.exoplayer.trackselection.TrackSelectorResult;
 import androidx.media3.exoplayer.upstream.Allocator;
@@ -49,6 +51,7 @@ import androidx.media3.exoplayer.upstream.BandwidthMeter;
 import androidx.media3.exoplayer.upstream.CmcdConfiguration;
 import androidx.media3.exoplayer.upstream.LoadErrorHandlingPolicy;
 import androidx.media3.exoplayer.upstream.PlayerIdAwareAllocator;
+import androidx.media3.exoplayer.util.SfpOomDebugLog;
 import com.google.errorprone.annotations.CanIgnoreReturnValue;
 import java.io.IOException;
 import java.util.Arrays;
@@ -273,6 +276,8 @@ public final class PreloadMediaSource extends WrappingMediaSource {
   @Nullable private Pair<PreloadMediaPeriod, MediaPeriodId> playingPreloadedMediaPeriodAndId;
   private boolean onSourcePreparedNotified;
   private boolean onUsedByPlayerNotified;
+  // SFP_OOM_DEBUG: guards the live-source counter against double release.
+  private boolean debugReleaseCounted;
 
   private PreloadMediaSource(
       MediaSource mediaSource,
@@ -294,6 +299,32 @@ public final class PreloadMediaSource extends WrappingMediaSource {
     preloadHandler = clock.createHandler(preloadLooper, /* callback= */ null);
     releaseHandler = clock.createHandler(preloadLooper, /* callback= */ null);
     startPositionUs = C.TIME_UNSET;
+    SfpOomDebugLog.d(
+        "PreloadMediaSource",
+        "created ["
+            + SfpOomDebugLog.id(this)
+            + "] uri="
+            + SfpOomDebugLog.describe(mediaSource.getMediaItem())
+            + " liveSources="
+            + SfpOomDebugLog.LIVE_PRELOAD_SOURCES.incrementAndGet());
+  }
+
+  // SFP_OOM_DEBUG: releases the wrapped period of a PreloadMediaPeriod and keeps the live counter
+  // in sync. Every PreloadMediaPeriod created in createPeriod() must go through here exactly once.
+  private void debugReleaseWrappedPeriod(PreloadMediaPeriod preloadMediaPeriod, String reason) {
+    mediaSource.releasePeriod(preloadMediaPeriod.mediaPeriod);
+    SfpOomDebugLog.d(
+        "PreloadMediaSource",
+        "["
+            + SfpOomDebugLog.id(this)
+            + "] released period="
+            + SfpOomDebugLog.id(preloadMediaPeriod)
+            + " reason="
+            + reason
+            + " livePeriods="
+            + SfpOomDebugLog.LIVE_PRELOAD_PERIODS.decrementAndGet()
+            + " "
+            + SfpOomDebugLog.heapSummary());
   }
 
   /**
@@ -308,6 +339,20 @@ public final class PreloadMediaSource extends WrappingMediaSource {
     preloadHandler.post(
         () -> {
           onSourcePreparedNotified = false;
+          SfpOomDebugLog.d(
+              "PreloadMediaSource",
+              "["
+                  + SfpOomDebugLog.id(this)
+                  + "] preload startPositionUs="
+                  + startPositionUs
+                  + " usedByPlayer="
+                  + isUsedByPlayer()
+                  + " alreadyPreloadCalled="
+                  + preloadCalled
+                  + " hasPreloadingPeriod="
+                  + (preloadingMediaPeriodAndKey != null)
+                  + " uri="
+                  + SfpOomDebugLog.describe(mediaSource.getMediaItem()));
           if (isUsedByPlayer()) {
             onUsedByPlayer();
           } else {
@@ -331,8 +376,14 @@ public final class PreloadMediaSource extends WrappingMediaSource {
     postOrRun(
         preloadHandler,
         () -> {
+          SfpOomDebugLog.d(
+              "PreloadMediaSource",
+              "["
+                  + SfpOomDebugLog.id(this)
+                  + "] clear hasPreloadingPeriod="
+                  + (preloadingMediaPeriodAndKey != null));
           if (preloadingMediaPeriodAndKey != null) {
-            mediaSource.releasePeriod(preloadingMediaPeriodAndKey.first.mediaPeriod);
+            debugReleaseWrappedPeriod(preloadingMediaPeriodAndKey.first, "clear");
             preloadingMediaPeriodAndKey = null;
           }
         });
@@ -341,6 +392,18 @@ public final class PreloadMediaSource extends WrappingMediaSource {
   @Override
   protected void prepareSourceInternal() {
     checkState(Looper.myLooper() == preloadHandler.getLooper());
+    SfpOomDebugLog.d(
+        "PreloadMediaSource",
+        "["
+            + SfpOomDebugLog.id(this)
+            + "] prepareSourceInternal usedByPlayer="
+            + isUsedByPlayer()
+            + " hasTimeline="
+            + (timeline != null)
+            + " childPrepared="
+            + prepareChildSourceCalled
+            + " playerId="
+            + getPlayerId().name);
     if (isUsedByPlayer() && !onUsedByPlayerNotified) {
       onUsedByPlayer();
     }
@@ -363,7 +426,14 @@ public final class PreloadMediaSource extends WrappingMediaSource {
             return;
           }
           onSourcePreparedNotified = true;
-          if (!preloadControl.onSourcePrepared(this)) {
+          boolean continueAfterPrepared = preloadControl.onSourcePrepared(this);
+          SfpOomDebugLog.d(
+              "PreloadMediaSource",
+              "["
+                  + SfpOomDebugLog.id(this)
+                  + "] source prepared, continuePreloading="
+                  + continueAfterPrepared);
+          if (!continueAfterPrepared) {
             stopPreloading();
             return;
           }
@@ -389,18 +459,48 @@ public final class PreloadMediaSource extends WrappingMediaSource {
     MediaPeriodKey key = new MediaPeriodKey(id, startPositionUs);
     if (preloadingMediaPeriodAndKey != null && key.equals(preloadingMediaPeriodAndKey.second)) {
       PreloadMediaPeriod mediaPeriod = checkNotNull(preloadingMediaPeriodAndKey).first;
+      SfpOomDebugLog.d(
+          "PreloadMediaSource",
+          "["
+              + SfpOomDebugLog.id(this)
+              + "] createPeriod REUSING preloaded period="
+              + SfpOomDebugLog.id(mediaPeriod)
+              + " usedByPlayer="
+              + isUsedByPlayer()
+              + " startPositionUs="
+              + startPositionUs);
       if (isUsedByPlayer()) {
         preloadingMediaPeriodAndKey = null;
         playingPreloadedMediaPeriodAndId = new Pair<>(mediaPeriod, id);
       }
       return mediaPeriod;
     } else if (preloadingMediaPeriodAndKey != null) {
-      mediaSource.releasePeriod(checkNotNull(preloadingMediaPeriodAndKey).first.mediaPeriod);
+      SfpOomDebugLog.w(
+          "PreloadMediaSource",
+          "["
+              + SfpOomDebugLog.id(this)
+              + "] createPeriod DISCARDING preloaded period (key mismatch) usedByPlayer="
+              + isUsedByPlayer()
+              + " startPositionUs="
+              + startPositionUs);
+      debugReleaseWrappedPeriod(checkNotNull(preloadingMediaPeriodAndKey).first, "keyMismatch");
       preloadingMediaPeriodAndKey = null;
     }
 
     PreloadMediaPeriod mediaPeriod =
         new PreloadMediaPeriod(mediaSource.createPeriod(id, allocator, startPositionUs));
+    SfpOomDebugLog.d(
+        "PreloadMediaSource",
+        "["
+            + SfpOomDebugLog.id(this)
+            + "] createPeriod NEW period="
+            + SfpOomDebugLog.id(mediaPeriod)
+            + " usedByPlayer="
+            + isUsedByPlayer()
+            + " startPositionUs="
+            + startPositionUs
+            + " livePeriods="
+            + SfpOomDebugLog.LIVE_PRELOAD_PERIODS.incrementAndGet());
     if (!isUsedByPlayer()) {
       preloadingMediaPeriodAndKey = new Pair<>(mediaPeriod, key);
     }
@@ -420,14 +520,17 @@ public final class PreloadMediaSource extends WrappingMediaSource {
   @Override
   public void releasePeriod(MediaPeriod mediaPeriod) {
     PreloadMediaPeriod preloadMediaPeriod = ((PreloadMediaPeriod) mediaPeriod);
+    String reason = "player";
     if (preloadingMediaPeriodAndKey != null
         && preloadMediaPeriod == checkNotNull(preloadingMediaPeriodAndKey).first) {
       preloadingMediaPeriodAndKey = null;
+      reason = "player(wasPreloading)";
     } else if (playingPreloadedMediaPeriodAndId != null
         && preloadMediaPeriod == checkNotNull(playingPreloadedMediaPeriodAndId).first) {
       playingPreloadedMediaPeriodAndId = null;
+      reason = "player(wasPlayingPreloaded)";
     }
-    mediaSource.releasePeriod(preloadMediaPeriod.mediaPeriod);
+    debugReleaseWrappedPeriod(preloadMediaPeriod, reason);
   }
 
   @Override
@@ -436,13 +539,38 @@ public final class PreloadMediaSource extends WrappingMediaSource {
       onUsedByPlayerNotified = false;
       if (preloadCalled && !releasePreloadMediaSourceCalled) {
         // PlayerId.PRELOAD takes over this source again.
+        SfpOomDebugLog.d(
+            "PreloadMediaSource",
+            "["
+                + SfpOomDebugLog.id(this)
+                + "] releaseSourceInternal: player left, source KEPT for PRELOAD (still holds"
+                + " periods="
+                + (preloadingMediaPeriodAndKey != null ? 1 : 0)
+                + "+"
+                + (playingPreloadedMediaPeriodAndId != null ? 1 : 0)
+                + ")");
         setPlayerId(PlayerId.PRELOAD);
         maybeSetPlayerIdForAllocator();
       } else {
+        SfpOomDebugLog.d(
+            "PreloadMediaSource",
+            "["
+                + SfpOomDebugLog.id(this)
+                + "] releaseSourceInternal: fully releasing child source (preloadCalled="
+                + preloadCalled
+                + ", releasePreloadCalled="
+                + releasePreloadMediaSourceCalled
+                + ")");
         timeline = null;
         prepareChildSourceCalled = false;
         super.releaseSourceInternal();
       }
+    } else {
+      SfpOomDebugLog.d(
+          "PreloadMediaSource",
+          "["
+              + SfpOomDebugLog.id(this)
+              + "] releaseSourceInternal ignored: still used by player");
     }
   }
 
@@ -454,6 +582,25 @@ public final class PreloadMediaSource extends WrappingMediaSource {
   public void releasePreloadMediaSource() {
     releaseHandler.post(
         () -> {
+          SfpOomDebugLog.d(
+              "PreloadMediaSource",
+              "["
+                  + SfpOomDebugLog.id(this)
+                  + "] releasePreloadMediaSource preloadCalled="
+                  + preloadCalled
+                  + " (loadControl.onReleased(PRELOAD) will be called="
+                  + preloadCalled
+                  + ") hasPreloadingPeriod="
+                  + (preloadingMediaPeriodAndKey != null)
+                  + " hasPlayingPreloadedPeriod="
+                  + (playingPreloadedMediaPeriodAndId != null)
+                  + " usedByPlayer="
+                  + isUsedByPlayer()
+                  + " liveSources="
+                  + (debugReleaseCounted
+                      ? SfpOomDebugLog.LIVE_PRELOAD_SOURCES.get()
+                      : SfpOomDebugLog.LIVE_PRELOAD_SOURCES.decrementAndGet()));
+          debugReleaseCounted = true;
           if (preloadCalled) {
             loadControl.onReleased(PlayerId.PRELOAD);
           }
@@ -462,7 +609,7 @@ public final class PreloadMediaSource extends WrappingMediaSource {
           startPositionUs = C.TIME_UNSET;
           onSourcePreparedNotified = false;
           if (preloadingMediaPeriodAndKey != null) {
-            mediaSource.releasePeriod(preloadingMediaPeriodAndKey.first.mediaPeriod);
+            debugReleaseWrappedPeriod(preloadingMediaPeriodAndKey.first, "releasePreloadMediaSource");
             preloadingMediaPeriodAndKey = null;
           }
           releaseSourceInternal();
@@ -476,6 +623,12 @@ public final class PreloadMediaSource extends WrappingMediaSource {
   }
 
   private void onUsedByPlayer() {
+    SfpOomDebugLog.d(
+        "PreloadMediaSource",
+        "["
+            + SfpOomDebugLog.id(this)
+            + "] onUsedByPlayer -> preloading stopped, uri="
+            + SfpOomDebugLog.describe(mediaSource.getMediaItem()));
     preloadControl.onUsedByPlayer(this);
     stopPreloading();
     onUsedByPlayerNotified = true;
@@ -494,6 +647,9 @@ public final class PreloadMediaSource extends WrappingMediaSource {
       }
       preloadHandler.postDelayed(this::checkForPreloadError, CHECK_FOR_PRELOAD_ERROR_INTERVAL_MS);
     } catch (IOException e) {
+      SfpOomDebugLog.w(
+          "PreloadMediaSource",
+          "[" + SfpOomDebugLog.id(this) + "] preload error: " + e + " -> preloading stopped");
       preloadControl.onPreloadError(
           new PreloadException(this.getMediaItem(), /* message= */ null, e), this);
       stopPreloading();
@@ -557,7 +713,24 @@ public final class PreloadMediaSource extends WrappingMediaSource {
             }
             preloadMediaPeriod.selectTracksForPreloading(
                 trackSelectorResult.selections, periodStartPositionUs);
-            if (!preloadControl.onTracksSelected(PreloadMediaSource.this)) {
+            int selectedCount = 0;
+            for (ExoTrackSelection selection : trackSelectorResult.selections) {
+              if (selection != null) {
+                selectedCount++;
+              }
+            }
+            boolean continueAfterTracks = preloadControl.onTracksSelected(PreloadMediaSource.this);
+            SfpOomDebugLog.d(
+                "PreloadMediaSource",
+                "["
+                    + SfpOomDebugLog.id(PreloadMediaSource.this)
+                    + "] tracks selected for preloading period="
+                    + SfpOomDebugLog.id(preloadMediaPeriod)
+                    + " selectedTracks="
+                    + selectedCount
+                    + " continuePreloading="
+                    + continueAfterTracks);
+            if (!continueAfterTracks) {
               stopPreloading();
               return;
             }
@@ -588,8 +761,20 @@ public final class PreloadMediaSource extends WrappingMediaSource {
                 onLoadToTheEndOfSource();
                 return;
               }
-              if (!preloadControl.onContinueLoadingRequested(
-                  PreloadMediaSource.this, bufferedPositionUs - periodStartPositionUs)) {
+              boolean continueLoading =
+                  preloadControl.onContinueLoadingRequested(
+                      PreloadMediaSource.this, bufferedPositionUs - periodStartPositionUs);
+              SfpOomDebugLog.d(
+                  "PreloadMediaSource",
+                  "["
+                      + SfpOomDebugLog.id(PreloadMediaSource.this)
+                      + "] onContinueLoadingRequested bufferedMs="
+                      + Util.usToMs(bufferedPositionUs - periodStartPositionUs)
+                      + " continue="
+                      + continueLoading
+                      + " "
+                      + SfpOomDebugLog.heapSummary());
+              if (!continueLoading) {
                 stopPreloading();
                 return;
               }
@@ -639,11 +824,25 @@ public final class PreloadMediaSource extends WrappingMediaSource {
         // times before continue loading, and we have let the PreloadControl know to make more
         // allocations available for this PreloadMediaSource, then we reset the retry count and
         // start to retry again.
+        SfpOomDebugLog.w(
+            "PreloadMediaSource",
+            "["
+                + SfpOomDebugLog.id(PreloadMediaSource.this)
+                + "] LoadControl refused preloading; control freed memory, retrying. "
+                + SfpOomDebugLog.heapSummary());
         continueLoadingRetryCountBeforeCallingPreloadControlAgain = 0;
       } else {
         // The PreloadControl cannot do more to make allocations available for this
         // PreloadMediaSource. Then we will still keep retrying maybeContinueLoading just in case
         // some allocations become available by any other means.
+        SfpOomDebugLog.w(
+            "PreloadMediaSource",
+            "["
+                + SfpOomDebugLog.id(PreloadMediaSource.this)
+                + "] LoadControl refused preloading; nothing left to free, polling every "
+                + MAYBE_CONTINUE_LOADING_INTERVAL_MS
+                + "ms. "
+                + SfpOomDebugLog.heapSummary());
         continueLoadingRetryCountBeforeCallingPreloadControlAgain = C.LENGTH_UNSET;
       }
       maybeContinueLoadingRunnable = () -> maybeContinueLoading(mediaPeriod, mediaPeriodId);
@@ -670,6 +869,12 @@ public final class PreloadMediaSource extends WrappingMediaSource {
 
     private void onLoadToTheEndOfSource() {
       if (!onLoadToTheEndOfSourceNotified) {
+        SfpOomDebugLog.d(
+            "PreloadMediaSource",
+            "["
+                + SfpOomDebugLog.id(PreloadMediaSource.this)
+                + "] loaded to the end of source; whole clip is now buffered in memory. "
+                + SfpOomDebugLog.heapSummary());
         preloadControl.onLoadedToTheEndOfSource(PreloadMediaSource.this);
         onLoadToTheEndOfSourceNotified = true;
       }

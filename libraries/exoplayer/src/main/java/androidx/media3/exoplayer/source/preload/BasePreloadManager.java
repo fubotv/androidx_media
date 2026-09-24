@@ -29,6 +29,7 @@ import androidx.media3.common.util.ListenerSet;
 import androidx.media3.common.util.UnstableApi;
 import androidx.media3.common.util.Util;
 import androidx.media3.exoplayer.source.MediaSource;
+import androidx.media3.exoplayer.util.SfpOomDebugLog;
 import com.google.common.base.Predicate;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -192,9 +193,38 @@ public abstract class BasePreloadManager<T, PreloadStatusT> {
    * @param rankingData The ranking data that is associated with the {@code mediaSource}.
    */
   public final void add(MediaSource mediaSource, T rankingData) {
+    @Nullable MediaSourceHolder existingHolder = mediaSourceHolderMap.get(mediaSource.getMediaItem());
+    if (existingHolder != null) {
+      // SFP_OOM_DEBUG: MediaItem has value equality, so a second add() for an equal item silently
+      // replaces the holder in the map; the previous PreloadMediaSource (and its loaded sample
+      // data) is never released by remove()/reset(). Surface it loudly.
+      SfpOomDebugLog.w(
+          "BasePreloadManager",
+          "add REPLACES holder for an equal MediaItem without releasing it (potential leak)"
+              + " uri="
+              + SfpOomDebugLog.describe(mediaSource.getMediaItem())
+              + " oldRanking="
+              + existingHolder.rankingData
+              + " newRanking="
+              + rankingData
+              + " oldSource="
+              + SfpOomDebugLog.id(existingHolder.getMediaSource()));
+    }
     MediaSourceHolder mediaHolder =
         createMediaSourceHolder(mediaSource.getMediaItem(), mediaSource, rankingData);
     mediaSourceHolderMap.put(mediaHolder.mediaItem, mediaHolder.getMediaSource(), mediaHolder);
+    SfpOomDebugLog.d(
+        "BasePreloadManager",
+        "add ranking="
+            + rankingData
+            + " uri="
+            + SfpOomDebugLog.describe(mediaHolder.mediaItem)
+            + " source="
+            + SfpOomDebugLog.id(mediaHolder.getMediaSource())
+            + " sourceCount="
+            + getSourceCount()
+            + " "
+            + SfpOomDebugLog.heapSummary());
   }
 
   /**
@@ -204,11 +234,31 @@ public abstract class BasePreloadManager<T, PreloadStatusT> {
   public final void invalidate() {
     synchronized (lock) {
       resetSourceHolderPriorityList();
+      SfpOomDebugLog.d(
+          "BasePreloadManager",
+          "invalidate sourceCount=" + sourceHolderPriorityList.size() + " order=" + debugOrder());
       while (indexForSourceHolderToPreload < sourceHolderPriorityList.size()
           && !maybeStartPreloadingNextSourceHolder()) {
         indexForSourceHolderToPreload++;
       }
     }
+  }
+
+  // SFP_OOM_DEBUG: ranking data of the holders in the current preload order.
+  @GuardedBy("lock")
+  private String debugOrder() {
+    StringBuilder builder = new StringBuilder("[");
+    for (int i = 0; i < sourceHolderPriorityList.size(); i++) {
+      if (i > 0) {
+        builder.append(", ");
+      }
+      MediaSourceHolder holder = sourceHolderPriorityList.get(i);
+      builder.append(holder.rankingData);
+      if (holder.isReleased()) {
+        builder.append("(released)");
+      }
+    }
+    return builder.append(']').toString();
   }
 
   @GuardedBy("lock")
@@ -247,11 +297,27 @@ public abstract class BasePreloadManager<T, PreloadStatusT> {
     if (mediaSourceHolder != null) {
       releaseMediaSourceHolderInternal(mediaSourceHolder);
       mediaSourceHolderMap.remove(mediaItem);
+      SfpOomDebugLog.d(
+          "BasePreloadManager",
+          "remove(mediaItem) ranking="
+              + mediaSourceHolder.rankingData
+              + " uri="
+              + SfpOomDebugLog.describe(mediaItem)
+              + " source="
+              + SfpOomDebugLog.id(mediaSourceHolder.getMediaSource())
+              + " sourceCount="
+              + getSourceCount());
       if (isCurrentlyPreloading(mediaSourceHolder)) {
         maybeAdvanceToNextMediaSourceHolder();
       }
       return true;
     }
+    SfpOomDebugLog.w(
+        "BasePreloadManager",
+        "remove(mediaItem) NOT FOUND uri="
+            + SfpOomDebugLog.describe(mediaItem)
+            + " sourceCount="
+            + getSourceCount());
     return false;
   }
 
@@ -323,6 +389,9 @@ public abstract class BasePreloadManager<T, PreloadStatusT> {
    * Resets the preload manager. All sources that the preload manager is holding will be released.
    */
   public final void reset() {
+    SfpOomDebugLog.d(
+        "BasePreloadManager",
+        "reset releasing sourceCount=" + getSourceCount() + " " + SfpOomDebugLog.heapSummary());
     for (MediaSourceHolder mediaHolder : mediaSourceHolderMap.values()) {
       releaseMediaSourceHolderInternal(mediaHolder);
     }
@@ -339,6 +408,7 @@ public abstract class BasePreloadManager<T, PreloadStatusT> {
    * <p>The preload manager must not be used after calling this method.
    */
   public final void release() {
+    SfpOomDebugLog.d("BasePreloadManager", "release [" + SfpOomDebugLog.id(this) + "]");
     reset();
     releaseInternal();
     clearListeners();
@@ -357,6 +427,13 @@ public abstract class BasePreloadManager<T, PreloadStatusT> {
 
           MediaSourceHolder mediaSourceHolder = checkNotNull(mediaSourceHolderMap.get(mediaSource));
           if (shouldNotifyListenerAndAdvancePredicate.apply(targetPreloadStatus)) {
+            SfpOomDebugLog.d(
+                "BasePreloadManager",
+                "onCompleted ranking="
+                    + mediaSourceHolder.rankingData
+                    + " uri="
+                    + SfpOomDebugLog.describe(mediaSourceHolder.mediaItem)
+                    + " -> advancing");
             listeners.sendEvent(listener -> listener.onCompleted(mediaSourceHolder.mediaItem));
             maybeAdvanceToNextMediaSourceHolder();
           }
@@ -396,6 +473,15 @@ public abstract class BasePreloadManager<T, PreloadStatusT> {
           }
 
           if (shouldNotifyListenerAndAdvancePredicate.apply(targetPreloadStatus)) {
+            SfpOomDebugLog.w(
+                "BasePreloadManager",
+                "onError uri="
+                    + SfpOomDebugLog.describe(mediaSource.getMediaItem())
+                    + " error="
+                    + error
+                    + " cause="
+                    + error.getCause()
+                    + " -> advancing");
             listeners.sendEvent(listener -> listener.onError(error));
             maybeAdvanceToNextMediaSourceHolder();
           }
@@ -435,6 +521,9 @@ public abstract class BasePreloadManager<T, PreloadStatusT> {
           }
 
           if (shouldAdvancePredicate.apply(targetPreloadStatus)) {
+            SfpOomDebugLog.d(
+                "BasePreloadManager",
+                "onSkipped uri=" + SfpOomDebugLog.describe(mediaSource.getMediaItem()) + " -> advancing");
             maybeAdvanceToNextMediaSourceHolder();
           }
         });
@@ -582,6 +671,16 @@ public abstract class BasePreloadManager<T, PreloadStatusT> {
       }
       this.targetPreloadStatusOfCurrentPreloadingSource =
           targetPreloadStatusControl.getTargetPreloadStatus(preloadingHolder.rankingData);
+      SfpOomDebugLog.d(
+          "BasePreloadManager",
+          "startPreloading index="
+              + indexForSourceHolderToPreload
+              + "/"
+              + sourceHolderPriorityList.size()
+              + " ranking="
+              + preloadingHolder.rankingData
+              + " uri="
+              + SfpOomDebugLog.describe(preloadingHolder.mediaItem));
       preloadMediaSourceHolderInternal(
           preloadingHolder, targetPreloadStatusOfCurrentPreloadingSource);
       return true;

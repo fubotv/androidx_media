@@ -23,6 +23,7 @@ import androidx.annotation.Nullable;
 import androidx.media3.common.util.NullableType;
 import androidx.media3.common.util.UnstableApi;
 import androidx.media3.common.util.Util;
+import androidx.media3.exoplayer.util.SfpOomDebugLog;
 import java.util.Arrays;
 
 /** Default implementation of {@link Allocator}. */
@@ -39,6 +40,11 @@ public final class DefaultAllocator implements Allocator {
   private int allocatedCount;
   private int availableCount;
   private @NullableType Allocation[] availableAllocations;
+
+  // SFP_OOM_DEBUG: growth tracking for the short-form player OOM investigation.
+  private static final long DEBUG_MILESTONE_BYTES = 8L * 1024L * 1024L;
+  private long debugLastMilestone;
+  private int debugPeakAllocatedCount;
 
   /**
    * Constructs an instance without creating any {@link Allocation}s up front.
@@ -83,6 +89,8 @@ public final class DefaultAllocator implements Allocator {
   }
 
   public synchronized void reset() {
+    SfpOomDebugLog.d(
+        "DefaultAllocator", "[" + SfpOomDebugLog.id(this) + "] reset trimOnReset=" + trimOnReset);
     if (trimOnReset) {
       setTargetBufferSize(0);
     }
@@ -90,6 +98,20 @@ public final class DefaultAllocator implements Allocator {
 
   public synchronized void setTargetBufferSize(int targetBufferSize) {
     boolean targetBufferSizeReduced = targetBufferSize < this.targetBufferSize;
+    if (targetBufferSize != this.targetBufferSize) {
+      SfpOomDebugLog.d(
+          "DefaultAllocator",
+          "["
+              + SfpOomDebugLog.id(this)
+              + "] setTargetBufferSize "
+              + SfpOomDebugLog.mb(this.targetBufferSize)
+              + " -> "
+              + SfpOomDebugLog.mb(targetBufferSize)
+              + " willTrim="
+              + targetBufferSizeReduced
+              + " "
+              + debugState());
+    }
     this.targetBufferSize = targetBufferSize;
     if (targetBufferSizeReduced) {
       trim();
@@ -112,6 +134,10 @@ public final class DefaultAllocator implements Allocator {
         availableAllocations = Arrays.copyOf(availableAllocations, availableAllocations.length * 2);
       }
     }
+    if (allocatedCount > debugPeakAllocatedCount) {
+      debugPeakAllocatedCount = allocatedCount;
+    }
+    maybeLogAllocationMilestone("allocate");
     return allocation;
   }
 
@@ -119,6 +145,7 @@ public final class DefaultAllocator implements Allocator {
   public synchronized void release(Allocation allocation) {
     availableAllocations[availableCount++] = allocation;
     allocatedCount--;
+    maybeLogAllocationMilestone("release");
   }
 
   @Override
@@ -128,6 +155,7 @@ public final class DefaultAllocator implements Allocator {
       allocatedCount--;
       allocationNode = allocationNode.next();
     }
+    maybeLogAllocationMilestone("releaseChain");
   }
 
   @Override
@@ -168,6 +196,16 @@ public final class DefaultAllocator implements Allocator {
     }
 
     // Discard allocations beyond the target.
+    SfpOomDebugLog.d(
+        "DefaultAllocator",
+        "["
+            + SfpOomDebugLog.id(this)
+            + "] trim discarding "
+            + (availableCount - targetAvailableCount)
+            + " pooled allocations ("
+            + SfpOomDebugLog.mb((long) (availableCount - targetAvailableCount) * individualAllocationSize)
+            + ") "
+            + debugState());
     Arrays.fill(availableAllocations, targetAvailableCount, availableCount, null);
     availableCount = targetAvailableCount;
   }
@@ -175,6 +213,37 @@ public final class DefaultAllocator implements Allocator {
   @Override
   public synchronized int getTotalBytesAllocated() {
     return allocatedCount * individualAllocationSize;
+  }
+
+  // SFP_OOM_DEBUG: logs whenever the in-use byte count crosses an 8MB boundary (up or down), so the
+  // sample-buffer footprint on the Java heap can be followed without per-allocation spam.
+  private void maybeLogAllocationMilestone(String reason) {
+    long milestone = ((long) allocatedCount * individualAllocationSize) / DEBUG_MILESTONE_BYTES;
+    if (milestone == debugLastMilestone) {
+      return;
+    }
+    debugLastMilestone = milestone;
+    SfpOomDebugLog.d(
+        "DefaultAllocator",
+        "["
+            + SfpOomDebugLog.id(this)
+            + "] "
+            + reason
+            + " "
+            + debugState()
+            + " "
+            + SfpOomDebugLog.heapSummary());
+  }
+
+  private String debugState() {
+    return "inUse="
+        + SfpOomDebugLog.mb((long) allocatedCount * individualAllocationSize)
+        + " pooledUnused="
+        + SfpOomDebugLog.mb((long) availableCount * individualAllocationSize)
+        + " target="
+        + SfpOomDebugLog.mb(targetBufferSize)
+        + " peakInUse="
+        + SfpOomDebugLog.mb((long) debugPeakAllocatedCount * individualAllocationSize);
   }
 
   @Override

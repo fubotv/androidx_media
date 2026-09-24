@@ -53,6 +53,7 @@ import androidx.media3.exoplayer.trackselection.DefaultTrackSelector;
 import androidx.media3.exoplayer.trackselection.TrackSelector;
 import androidx.media3.exoplayer.upstream.BandwidthMeter;
 import androidx.media3.exoplayer.upstream.DefaultBandwidthMeter;
+import androidx.media3.exoplayer.util.SfpOomDebugLog;
 import com.google.common.base.Predicate;
 import com.google.common.base.Supplier;
 import com.google.common.base.Suppliers;
@@ -678,6 +679,16 @@ public final class DefaultPreloadManager
       preCacheHelperFactory = null;
     }
     preloadHandler = builder.clock.createHandler(preloadLooper, /* callback= */ null);
+    SfpOomDebugLog.d(
+        "DefaultPreloadManager",
+        "created ["
+            + SfpOomDebugLog.id(this)
+            + "] loadControl="
+            + SfpOomDebugLog.id(builder.loadControlSupplier.get())
+            + " preCache="
+            + (cache != null)
+            + " "
+            + SfpOomDebugLog.heapSummary());
   }
 
   /**
@@ -688,7 +699,25 @@ public final class DefaultPreloadManager
   public void setCurrentPlayingIndex(int currentPlayingIndex) {
     SimpleRankingDataComparator rankingDataComparator =
         (SimpleRankingDataComparator) this.rankingDataComparator;
+    SfpOomDebugLog.d(
+        "DefaultPreloadManager",
+        "setCurrentPlayingIndex "
+            + rankingDataComparator.getCurrentPlayingIndex()
+            + " -> "
+            + currentPlayingIndex
+            + " sourceCount="
+            + getSourceCount());
     rankingDataComparator.setCurrentPlayingIndex(currentPlayingIndex);
+  }
+
+  // SFP_OOM_DEBUG: human readable target status.
+  private static String describeStatus(PreloadStatus status) {
+    return "stage="
+        + status.stage
+        + " startMs="
+        + status.startPositionMs
+        + " durationMs="
+        + status.durationMs;
   }
 
   @Override
@@ -711,6 +740,17 @@ public final class DefaultPreloadManager
     PreloadMediaSourceHolder preloadMediaSourceHolder =
         (PreloadMediaSourceHolder) mediaSourceHolder;
     PreloadMediaSource preloadMediaSource = preloadMediaSourceHolder.getMediaSource();
+    SfpOomDebugLog.d(
+        "DefaultPreloadManager",
+        "preloadMediaSourceHolderInternal ranking="
+            + mediaSourceHolder.rankingData
+            + " source="
+            + SfpOomDebugLog.id(preloadMediaSource)
+            + " uri="
+            + SfpOomDebugLog.describe(mediaSourceHolder.mediaItem)
+            + " target["
+            + describeStatus(targetPreloadStatus)
+            + "]");
     maybeClearPreloadMediaSource(preloadMediaSource, targetPreloadStatus);
     if (targetPreloadStatus.equals(PreloadStatus.PRELOAD_STATUS_NOT_PRELOADED)) {
       onSkipped(
@@ -740,6 +780,13 @@ public final class DefaultPreloadManager
       // temporarily don't require the current media to be loaded, which means that the cached
       // content on disk may still persist. All data will be removed only when this media is
       // removed from DefaultPreloadManager.
+      SfpOomDebugLog.d(
+          "DefaultPreloadManager",
+          "clearing in-memory sample data of source="
+              + SfpOomDebugLog.id(preloadMediaSource)
+              + " because target["
+              + describeStatus(targetPreloadStatus)
+              + "]");
       preloadMediaSource.clear();
     }
   }
@@ -753,6 +800,14 @@ public final class DefaultPreloadManager
     checkArgument(mediaSourceHolder instanceof PreloadMediaSourceHolder);
     PreloadMediaSourceHolder preloadMediaSourceHolder =
         (PreloadMediaSourceHolder) mediaSourceHolder;
+    SfpOomDebugLog.d(
+        "DefaultPreloadManager",
+        "releaseMediaSourceHolderInternal ranking="
+            + mediaSourceHolder.rankingData
+            + " source="
+            + SfpOomDebugLog.id(preloadMediaSourceHolder.getMediaSource())
+            + " uri="
+            + SfpOomDebugLog.describe(mediaSourceHolder.mediaItem));
     preloadMediaSourceHolder.getMediaSource().releasePreloadMediaSource();
     if (preloadMediaSourceHolder.preCacheHelper != null) {
       preloadMediaSourceHolder.preCacheHelper.release(/* removeCachedContent= */ true);
@@ -762,6 +817,9 @@ public final class DefaultPreloadManager
 
   @Override
   protected void releaseInternal() {
+    SfpOomDebugLog.d(
+        "DefaultPreloadManager",
+        "releaseInternal [" + SfpOomDebugLog.id(this) + "] " + SfpOomDebugLog.heapSummary());
     releaseCalled = true;
     releasePreloadUtils();
     releasePreCacheUtils();
@@ -870,6 +928,14 @@ public final class DefaultPreloadManager
     @Override
     public void onUsedByPlayer(PreloadMediaSource mediaSource) {
       PreloadStatus targetPreloadStatus = getTargetPreloadStatusIfCurrentlyPreloading(mediaSource);
+      SfpOomDebugLog.d(
+          "DefaultPreloadManager",
+          "onUsedByPlayer source="
+              + SfpOomDebugLog.id(mediaSource)
+              + " uri="
+              + SfpOomDebugLog.describe(mediaSource.getMediaItem())
+              + " wasCurrentlyPreloading="
+              + (targetPreloadStatus != null));
       if (targetPreloadStatus == null || !targetPreloadStatus.isPreloadingCategory()) {
         // If the mediaSource is not the currently loading, skip silently as invalidate() must have
         // been called, and a new sequence of preloading must have started.
@@ -882,6 +948,14 @@ public final class DefaultPreloadManager
     @Override
     public void onLoadedToTheEndOfSource(PreloadMediaSource mediaSource) {
       PreloadStatus targetPreloadStatus = getTargetPreloadStatusIfCurrentlyPreloading(mediaSource);
+      SfpOomDebugLog.d(
+          "DefaultPreloadManager",
+          "onLoadedToTheEndOfSource source="
+              + SfpOomDebugLog.id(mediaSource)
+              + " uri="
+              + SfpOomDebugLog.describe(mediaSource.getMediaItem())
+              + " wasCurrentlyPreloading="
+              + (targetPreloadStatus != null));
       if (targetPreloadStatus == null || !targetPreloadStatus.isPreloadingCategory()) {
         // If the mediaSource is not the currently loading, skip silently as invalidate() must have
         // been called, and a new sequence of preloading must have started.
@@ -895,6 +969,18 @@ public final class DefaultPreloadManager
     public void onPreloadError(PreloadException error, PreloadMediaSource mediaSource) {
       @Nullable
       PreloadStatus targetPreloadStatus = getTargetPreloadStatusIfCurrentlyPreloading(mediaSource);
+      SfpOomDebugLog.w(
+          "DefaultPreloadManager",
+          "onPreloadError source="
+              + SfpOomDebugLog.id(mediaSource)
+              + " uri="
+              + SfpOomDebugLog.describe(mediaSource.getMediaItem())
+              + " error="
+              + error
+              + " cause="
+              + error.getCause()
+              + " wasCurrentlyPreloading="
+              + (targetPreloadStatus != null));
       if (targetPreloadStatus == null || !targetPreloadStatus.isPreloadingCategory()) {
         // If the mediaSource is not the currently loading, skip silently as invalidate() must have
         // been called, and a new sequence of preloading must have started.
@@ -910,10 +996,23 @@ public final class DefaultPreloadManager
       if (sourceHolder != null) {
         PreloadMediaSource lowestPriorityPreloadMediaSource =
             (PreloadMediaSource) sourceHolder.getMediaSource();
+        SfpOomDebugLog.w(
+            "DefaultPreloadManager",
+            "onLoadingUnableToContinue (PRELOAD byte budget reached) for source="
+                + SfpOomDebugLog.id(mediaSource)
+                + " -> clearing lowest priority ranking="
+                + sourceHolder.rankingData
+                + " source="
+                + SfpOomDebugLog.id(lowestPriorityPreloadMediaSource));
         lowestPriorityPreloadMediaSource.clear();
         DefaultPreloadManager.this.onSourceCleared();
         return true;
       }
+      SfpOomDebugLog.w(
+          "DefaultPreloadManager",
+          "onLoadingUnableToContinue (PRELOAD byte budget reached) for source="
+              + SfpOomDebugLog.id(mediaSource)
+              + " -> nothing left to clear");
       return false;
     }
 
@@ -924,6 +1023,15 @@ public final class DefaultPreloadManager
         if (continueLoadingPredicate.apply(targetPreloadStatus)) {
           return true;
         }
+        SfpOomDebugLog.d(
+            "DefaultPreloadManager",
+            "preload target reached for source="
+                + SfpOomDebugLog.id(mediaSource)
+                + " uri="
+                + SfpOomDebugLog.describe(mediaSource.getMediaItem())
+                + " target["
+                + describeStatus(targetPreloadStatus)
+                + "] -> completed");
         DefaultPreloadManager.this.onCompleted(
             mediaSource, preloadStatus -> preloadStatus.equals(targetPreloadStatus));
       }

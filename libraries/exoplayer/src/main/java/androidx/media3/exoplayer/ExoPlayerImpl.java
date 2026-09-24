@@ -95,6 +95,7 @@ import androidx.media3.common.util.Size;
 import androidx.media3.common.util.StuckPlayerDetector;
 import androidx.media3.common.util.StuckPlayerException;
 import androidx.media3.common.util.Util;
+import androidx.media3.exoplayer.util.SfpOomDebugLog;
 import androidx.media3.common.util.WakeLockManager;
 import androidx.media3.common.util.WifiLockManager;
 import androidx.media3.exoplayer.PlayerMessage.Target;
@@ -269,6 +270,16 @@ import java.util.function.IntConsumer;
               + "] ["
               + Util.DEVICE_DEBUG_INFO
               + "]");
+      SfpOomDebugLog.d(
+          "ExoPlayerImpl",
+          "Init ["
+              + SfpOomDebugLog.id(this)
+              + "] name="
+              + builder.playerName
+              + " liveExoPlayers="
+              + SfpOomDebugLog.LIVE_EXO_PLAYERS.incrementAndGet()
+              + " "
+              + SfpOomDebugLog.heapSummary());
       applicationContext = builder.context.getApplicationContext();
       analyticsCollector = builder.analyticsCollectorFunction.apply(builder.clock);
       priority = builder.priority;
@@ -1139,6 +1150,19 @@ import java.util.function.IntConsumer;
             + MediaLibraryInfo.registeredModules()
             + "]");
     verifyApplicationThread();
+    if (!playerReleased) {
+      SfpOomDebugLog.d(
+          "ExoPlayerImpl",
+          "Release ["
+              + SfpOomDebugLog.id(this)
+              + "] liveExoPlayers="
+              + SfpOomDebugLog.LIVE_EXO_PLAYERS.decrementAndGet()
+              + " "
+              + SfpOomDebugLog.heapSummary());
+    } else {
+      SfpOomDebugLog.w(
+          "ExoPlayerImpl", "Release [" + SfpOomDebugLog.id(this) + "] called on an already released player");
+    }
     audioBecomingNoisyManager.setEnabled(false);
     if (streamVolumeManager != null) {
       streamVolumeManager.release();

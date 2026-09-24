@@ -80,6 +80,7 @@ import androidx.media3.exoplayer.source.MediaPeriod;
 import androidx.media3.exoplayer.source.MediaSource;
 import androidx.media3.exoplayer.source.SampleStream;
 import androidx.media3.exoplayer.source.SampleStream.ReadDataResult;
+import androidx.media3.exoplayer.util.SfpOomDebugLog;
 import androidx.media3.exoplayer.source.SampleStream.ReadFlags;
 import com.google.common.collect.ImmutableSet;
 import java.lang.annotation.Documented;
@@ -889,6 +890,16 @@ public abstract class MediaCodecRenderer extends BaseRenderer {
       if (codec != null) {
         codec.release();
         decoderCounters.decoderReleaseCount++;
+        SfpOomDebugLog.d(
+            "MediaCodecRenderer",
+            "codec released name="
+                + checkNotNull(codecInfo).name
+                + " trackType="
+                + getTrackType()
+                + " renderer="
+                + SfpOomDebugLog.id(this)
+                + " liveCodecs="
+                + SfpOomDebugLog.LIVE_CODECS.decrementAndGet());
         onCodecReleased(checkNotNull(codecInfo).name);
       }
     } finally {
@@ -1420,6 +1431,22 @@ public abstract class MediaCodecRenderer extends BaseRenderer {
       codec = codecAdapterFactory.createAdapter(configuration);
       codecRegisteredOnBufferAvailableListener =
           codec.registerOnBufferAvailableListener(new MediaCodecRendererCodecAdapterListener());
+      SfpOomDebugLog.d(
+          "MediaCodecRenderer",
+          "codec created name="
+              + codecName
+              + " mime="
+              + inputFormat.sampleMimeType
+              + " trackType="
+              + getTrackType()
+              + " renderer="
+              + SfpOomDebugLog.id(this)
+              + " player="
+              + getPlayerId().name
+              + " liveCodecs="
+              + SfpOomDebugLog.LIVE_CODECS.incrementAndGet()
+              + " "
+              + SfpOomDebugLog.heapSummary());
     } finally {
       TraceUtil.endSection();
     }

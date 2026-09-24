@@ -46,6 +46,7 @@ import androidx.media3.exoplayer.upstream.Allocation;
 import androidx.media3.exoplayer.upstream.Allocator;
 import androidx.media3.exoplayer.upstream.DefaultAllocator;
 import androidx.media3.exoplayer.upstream.PlayerIdAwareAllocator;
+import androidx.media3.exoplayer.util.SfpOomDebugLog;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.errorprone.annotations.CanIgnoreReturnValue;
@@ -719,6 +720,20 @@ public class DefaultLoadControl implements LoadControl {
       playerLoadingState.referenceCount++;
     }
     resetPlayerLoadingState(playerId);
+    SfpOomDebugLog.d(
+        "DefaultLoadControl",
+        "["
+            + SfpOomDebugLog.id(this)
+            + "] onPrepared player="
+            + playerId.name
+            + " refCount="
+            + checkNotNull(loadingStates.get(playerId)).referenceCount
+            + " trackedPlayers="
+            + loadingStates.size()
+            + " totalTarget="
+            + SfpOomDebugLog.mb(calculateTotalTargetBufferBytes())
+            + " "
+            + debugAllocatorState());
   }
 
   @Override
@@ -731,20 +746,103 @@ public class DefaultLoadControl implements LoadControl {
         targetBufferBytesOverwrite == C.LENGTH_UNSET
             ? calculateTargetBufferBytes(parameters, trackSelections)
             : targetBufferBytesOverwrite;
+    SfpOomDebugLog.d(
+        "DefaultLoadControl",
+        "["
+            + SfpOomDebugLog.id(this)
+            + "] onTracksSelected player="
+            + parameters.playerId.name
+            + " playerTarget="
+            + SfpOomDebugLog.mb(checkNotNull(loadingStates.get(parameters.playerId)).targetBufferBytes)
+            + " (overwrite="
+            + (targetBufferBytesOverwrite == C.LENGTH_UNSET
+                ? "none"
+                : SfpOomDebugLog.mb(targetBufferBytesOverwrite))
+            + ") totalTarget="
+            + SfpOomDebugLog.mb(calculateTotalTargetBufferBytes()));
     updateAllocator();
   }
 
   @Override
   public void onStopped(PlayerId playerId) {
     removePlayer(playerId);
+    debugLogPlayerRemoved("onStopped", playerId);
   }
 
   @Override
   public void onReleased(PlayerId playerId) {
     removePlayer(playerId);
+    debugLogPlayerRemoved("onReleased", playerId);
     if (loadingStates.isEmpty()) {
       threadId = C.INDEX_UNSET;
     }
+  }
+
+  // SFP_OOM_DEBUG: a PRELOAD reference count that never returns to 0 keeps the preload target
+  // bytes in the allocator budget forever, so the remaining count is logged on every removal.
+  private void debugLogPlayerRemoved(String event, PlayerId playerId) {
+    @Nullable PlayerLoadingState remaining = loadingStates.get(playerId);
+    SfpOomDebugLog.d(
+        "DefaultLoadControl",
+        "["
+            + SfpOomDebugLog.id(this)
+            + "] "
+            + event
+            + " player="
+            + playerId.name
+            + (remaining == null
+                ? " -> removed"
+                : " -> stillTracked refCount="
+                    + remaining.referenceCount
+                    + " allocated="
+                    + SfpOomDebugLog.mb(getTotalBufferBytesAllocated(playerId)))
+            + " trackedPlayers="
+            + loadingStates.size()
+            + " totalTarget="
+            + SfpOomDebugLog.mb(calculateTotalTargetBufferBytes())
+            + " "
+            + debugAllocatorState());
+  }
+
+  private String debugAllocatorState() {
+    return "allocatorInUse="
+        + SfpOomDebugLog.mb(allocator.getTotalBytesAllocated())
+        + " allocatorPooledUnused="
+        + SfpOomDebugLog.mb(allocator.getUnusedBytesAllocated());
+  }
+
+  // SFP_OOM_DEBUG: logs shouldContinueLoading only when the decision flips for a player, which
+  // shows exactly when the byte budget (targetReached) rather than the duration stops loading.
+  private boolean debugLogDecision(
+      PlayerLoadingState playerLoadingState,
+      Parameters parameters,
+      boolean shouldContinue,
+      boolean targetBufferSizeReached) {
+    @Nullable Boolean last = playerLoadingState.debugLastShouldContinue;
+    if (last == null || last != shouldContinue) {
+      playerLoadingState.debugLastShouldContinue = shouldContinue;
+      SfpOomDebugLog.d(
+          "DefaultLoadControl",
+          "["
+              + SfpOomDebugLog.id(this)
+              + "] shouldContinueLoading player="
+              + parameters.playerId.name
+              + " -> "
+              + shouldContinue
+              + " bufferedMs="
+              + Util.usToMs(parameters.bufferedDurationUs)
+              + " playerAllocated="
+              + SfpOomDebugLog.mb(getTotalBufferBytesAllocated(parameters.playerId))
+              + " playerTarget="
+              + SfpOomDebugLog.mb(getTargetBufferBytes(parameters.playerId))
+              + " targetReached="
+              + targetBufferSizeReached
+              + " "
+              + debugAllocatorState()
+              + " "
+              + SfpOomDebugLog.heapSummary());
+    }
+    return shouldContinue;
   }
 
   @Override
@@ -769,7 +867,8 @@ public class DefaultLoadControl implements LoadControl {
     boolean targetBufferSizeReached =
         getTotalBufferBytesAllocated(playerId) >= getTargetBufferBytes(playerId);
     if (playerId.equals(PlayerId.PRELOAD)) {
-      return !targetBufferSizeReached;
+      return debugLogDecision(
+          playerLoadingState, parameters, !targetBufferSizeReached, targetBufferSizeReached);
     }
     boolean isLocalPlayback = isLocalPlayback(parameters);
     long minBufferUs = getMinBufferUs(isLocalPlayback);
@@ -805,7 +904,8 @@ public class DefaultLoadControl implements LoadControl {
     } else if (parameters.bufferedDurationUs >= maxBufferUs || targetBufferSizeReached) {
       playerLoadingState.isLoading = false;
     } // Else don't change the loading state.
-    return playerLoadingState.isLoading;
+    return debugLogDecision(
+        playerLoadingState, parameters, playerLoadingState.isLoading, targetBufferSizeReached);
   }
 
   @Override
@@ -916,8 +1016,19 @@ public class DefaultLoadControl implements LoadControl {
 
   private void updateAllocator() {
     if (loadingStates.isEmpty()) {
+      SfpOomDebugLog.d(
+          "DefaultLoadControl",
+          "[" + SfpOomDebugLog.id(this) + "] updateAllocator: no players -> allocator.reset()");
       allocator.reset();
     } else {
+      SfpOomDebugLog.d(
+          "DefaultLoadControl",
+          "["
+              + SfpOomDebugLog.id(this)
+              + "] updateAllocator: totalTarget="
+              + SfpOomDebugLog.mb(calculateTotalTargetBufferBytes())
+              + " trackedPlayers="
+              + loadingStates.size());
       allocator.setTargetBufferSize(calculateTotalTargetBufferBytes());
     }
   }
@@ -1021,6 +1132,8 @@ public class DefaultLoadControl implements LoadControl {
     public int referenceCount;
     public boolean isLoading;
     public int targetBufferBytes;
+    // SFP_OOM_DEBUG: last shouldContinueLoading result, used to log only on flips.
+    @Nullable public Boolean debugLastShouldContinue;
 
     @GuardedBy("this")
     private int allocatedCounts;
